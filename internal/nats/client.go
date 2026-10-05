@@ -3,6 +3,7 @@ package nats
 import (
 	"context"
 	"fmt"
+	"time"
 
 	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -12,10 +13,15 @@ type Client struct {
 	Conn   *natsgo.Conn
 	JS     jetstream.JetStream
 	Stream jetstream.Stream
+	closed <-chan struct{}
 }
 
 func New(ctx context.Context) (*Client, error) {
-	nc, err := natsgo.Connect("nats://localhost:4222")
+	closed := make(chan struct{})
+	nc, err := natsgo.Connect("nats://localhost:4222",
+		natsgo.DrainTimeout(5*time.Second),
+		natsgo.ClosedHandler(func(*natsgo.Conn) { close(closed) }),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -42,11 +48,27 @@ func New(ctx context.Context) (*Client, error) {
 		Conn:   nc,
 		JS:     js,
 		Stream: stream,
+		closed: closed,
 	}, nil
 }
 
 func (c *Client) Close() error {
-	return c.Conn.Drain()
+	if c.Conn.IsClosed() {
+		return nil
+	}
+	if err := c.Conn.Drain(); err != nil {
+		c.Conn.Close()
+		return err
+	}
+	timer := time.NewTimer(6 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-c.closed:
+		return c.Conn.LastError()
+	case <-timer.C:
+		c.Conn.Close()
+		return fmt.Errorf("NATS drain timeout")
+	}
 }
 
 func (c *Client) PublishOrderStatus(

@@ -59,6 +59,7 @@ func UpdateOrder(
 
 		updatedAt, err := repo.Save(r.Context(), order)
 		if err != nil {
+			log.Printf("failed to save order order_id=%s: %v", req.OrderID, err)
 			http.Error(w, "failed to save order", http.StatusInternalServerError)
 			return
 		}
@@ -71,6 +72,7 @@ func UpdateOrder(
 
 		data, err := json.Marshal(event)
 		if err != nil {
+			log.Printf("failed to encode order event order_id=%s: %v", req.OrderID, err)
 			http.Error(w, "failed to encode event", http.StatusInternalServerError)
 			return
 		}
@@ -84,20 +86,16 @@ func UpdateOrder(
 			msgID,
 		)
 
-		log.Printf(
-			"stream=%s subject=%s seq=%d",
-			ack.Stream,
-			"order.status."+req.OrderID,
-			ack.Sequence,
-		)
 		if err != nil {
+			log.Printf("failed to publish order order_id=%s: %v", req.OrderID, err)
 			http.Error(w, "failed to publish event", http.StatusInternalServerError)
 			return
 		}
+		log.Printf("stream=%s subject=%s seq=%d", ack.Stream, "order.status."+req.OrderID, ack.Sequence)
 
 		err = natsClient.PrintStreamInfo(r.Context())
 		if err != nil {
-			log.Printf("failed to get stream info: %v", err)
+			log.Printf("failed to get stream info order_id=%s: %v", req.OrderID, err)
 		}
 		response := model.UpdateOrderResponse{
 			OrderID:   req.OrderID,
@@ -150,6 +148,7 @@ func GetOrder(repo *repository.OrderRepository) http.HandlerFunc {
 				return
 			}
 
+			log.Printf("failed to get order order_id=%s: %v", orderID, err)
 			http.Error(w, "failed to get order", http.StatusInternalServerError)
 			return
 		}
@@ -193,6 +192,7 @@ func GetOrderFromStream(
 			}
 
 			if errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("timed out getting order from stream order_id=%s: %v", orderID, err)
 				http.Error(
 					w,
 					"JetStream request timeout",
@@ -201,6 +201,7 @@ func GetOrderFromStream(
 				return
 			}
 
+			log.Printf("failed to get order from stream order_id=%s: %v", orderID, err)
 			http.Error(
 				w,
 				"failed to get order status from stream",
@@ -213,6 +214,7 @@ func GetOrderFromStream(
 
 		err = json.Unmarshal(msg.Data, &order)
 		if err != nil {
+			log.Printf("failed to decode stream message order_id=%s: %v", orderID, err)
 			http.Error(
 				w,
 				"failed to decode stream message",

@@ -46,6 +46,9 @@ func NewOrderConsumer(
 }
 
 func (w *OrderConsumer) ProcessOnce(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	batch, err := w.consumer.Fetch(
 		100,
 		jetstream.FetchMaxWait(2*time.Second),
@@ -55,6 +58,9 @@ func (w *OrderConsumer) ProcessOnce(ctx context.Context) error {
 	}
 
 	for msg := range batch.Messages() {
+		if ctx.Err() != nil {
+			continue // Оставляем сообщение без ACK для повторной доставки.
+		}
 
 		metadata, err := msg.Metadata()
 		if err == nil {
@@ -67,7 +73,11 @@ func (w *OrderConsumer) ProcessOnce(ctx context.Context) error {
 			)
 		}
 
-		w.processMessage(ctx, msg)
+		// Завершаем текущее сообщение даже после сигнала остановки.
+		// Ограничиваем обработку, чтобы shutdown не завис на Redis/retry.
+		processCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 25*time.Second)
+		w.processMessage(processCtx, msg)
+		cancel()
 	}
 
 	if err := batch.Error(); err != nil {
@@ -146,6 +156,9 @@ func (w *OrderConsumer) processMessage(
 	ctx context.Context,
 	msg jetstream.Msg,
 ) {
+	if ctx.Err() != nil {
+		return
+	}
 	var order model.Order
 
 	if err := json.Unmarshal(msg.Data(), &order); err != nil {
@@ -180,6 +193,10 @@ func (w *OrderConsumer) processMessage(
 				attempt,
 			)
 
+			return
+		}
+
+		if ctx.Err() != nil {
 			return
 		}
 

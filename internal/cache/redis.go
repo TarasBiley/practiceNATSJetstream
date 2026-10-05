@@ -17,6 +17,7 @@ func NewRedisClient(ctx context.Context) (*RedisClient, error) {
 	})
 
 	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
 		return nil, err
 	}
 
