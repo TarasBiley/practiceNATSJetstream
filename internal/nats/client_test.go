@@ -2,8 +2,12 @@ package nats
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"github.com/nats-io/nats.go/jetstream"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -40,6 +44,10 @@ func TestCloseWaitsForDrain(t *testing.T) {
 				fmt.Fprint(conn, "PONG\r\n")
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			t.Errorf("scanner error: %v", err)
+		}
+
 	}()
 	closed := make(chan struct{})
 	nc, err := natsgo.Connect("nats://"+listener.Addr().String(),
@@ -77,5 +85,60 @@ func TestCloseWaitsForDrain(t *testing.T) {
 	}
 	if err := client.Close(); err != nil {
 		t.Fatalf("repeated Close failed: %v", err)
+	}
+}
+
+type lastMessageStream struct {
+	jetstream.Stream
+	message *jetstream.RawStreamMsg
+}
+
+func (s lastMessageStream) GetLastMsgForSubject(context.Context, string) (*jetstream.RawStreamMsg, error) {
+	return s.message, nil
+}
+
+func TestPublishRecoversWithoutRepublishing(t *testing.T) {
+	data := []byte(`{"order_id":"order-1","status":"paid"}`)
+	client := &Client{Stream: lastMessageStream{message: &jetstream.RawStreamMsg{
+		Data: data, Sequence: 42, Header: natsgo.Header{jetstream.MsgIDHeader: []string{"request-id"}},
+	}}}
+	// JS is nil: any actual publish would panic. Recovery is independent of the dedup window.
+	ack, err := client.PublishOrderStatus(context.Background(), "order-1", data, "request-id", 0)
+	if err != nil || ack.Sequence != 42 || !ack.Duplicate {
+		t.Fatalf("ack=%+v err=%v", ack, err)
+	}
+	_, err = client.PublishOrderStatus(context.Background(), "order-1", []byte("different"), "request-id", 0)
+	if !errors.Is(err, ErrPublishConflict) {
+		t.Fatalf("mismatched recovered event: %v", err)
+	}
+}
+
+func TestPublishCASIntegration(t *testing.T) {
+	url := os.Getenv("TEST_NATS_URL")
+	if url == "" {
+		t.Skip("set TEST_NATS_URL to an isolated JetStream server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := New(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	id := fmt.Sprintf("cas-%d", time.Now().UnixNano())
+	first, err := client.PublishOrderStatus(ctx, id, []byte("first"), id+"-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.PublishOrderStatus(ctx, id, []byte("stale"), id+"-2", 0); !errors.Is(err, ErrPublishConflict) {
+		t.Fatalf("CAS failed to reject stale sequence: %v", err)
+	}
+	replay, err := client.PublishOrderStatus(ctx, id, []byte("first"), id+"-1", 0)
+	if err != nil || replay.Sequence != first.Sequence || !replay.Duplicate {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	next, err := client.PublishOrderStatus(ctx, id, []byte("next"), id+"-3", first.Sequence)
+	if err != nil || next.Sequence <= first.Sequence {
+		t.Fatalf("next=%+v err=%v", next, err)
 	}
 }

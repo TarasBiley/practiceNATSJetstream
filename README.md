@@ -18,15 +18,11 @@
 ```text
 POST /api/orders
         |
-        +----> PostgreSQL
+        v
+   NATS JetStream ----> Pull Consumer ----> Redis
         |
-        +----> NATS JetStream
-                   |
-                   v
-              Pull Consumer
-                   |
-                   v
-                 Redis
+        v
+    PostgreSQL
 ```
 
 PostgreSQL хранит актуальное состояние заказа.
@@ -55,6 +51,7 @@ order.status.order-100
 
 ```http
 POST /api/orders
+Idempotency-Key: unique-request-key
 ```
 
 Request:
@@ -87,7 +84,39 @@ Response:
 
 При обновлении существующего заказа используется PostgreSQL UPSERT.
 
-После сохранения статус публикуется в NATS JetStream.
+Порядок обновления: валидация → idempotency claim → подготовка события → публикация в
+JetStream → запись заказа в PostgreSQL и завершение idempotency → ответ.
+Один timestamp создаётся в Go (UTC, точность до микросекунд) и сохраняется в событии,
+таблицах `orders` / `idempotency_keys` и HTTP-ответе.
+
+`Idempotency-Key` обязателен (до 256 байт). Повтор с тем же ключом и тем же
+логическим JSON возвращает первоначальный `updated_at` без нового события.
+Порядок полей JSON и пробелы не влияют на SHA-256 request hash; неизвестные поля
+и несколько JSON-объектов в одном запросе отклоняются. Другой body с тем же ключом — 409.
+Параллельный запрос с занятым ключом также получает 409 и может повториться позже.
+`order_id` во всех HTTP handlers соответствует `^[A-Za-z0-9_-]{1,64}$`.
+
+Idempotency использует PostgreSQL session advisory lock для одной активной попытки
+и уникальный индекс для одного незавершённого обновления заказа. В таблице остаются:
+
+- `updated_at` и `expected_sequence`: сохранённое намерение публикации;
+- `published_sequence`: подтверждённая публикация;
+- `completed`: заказ и результат записаны одной SQL-транзакцией.
+
+До сохранения намерения ошибка освобождает claim. После него запись сохраняется:
+повтор того же ключа и body продолжает обработку. При ошибке PostgreSQL после
+публикации повтор выполняет только оставшуюся SQL-часть. При потере PubAck или
+ошибке записи `published_sequence` публикация распознаётся по MsgId и точному
+содержимому последнего сообщения. Сохранённый expected sequence защищает от
+повторного события даже после истечения окна дедупликации NATS.
+
+Пока операция незавершена, другой ключ для этого заказа получает 409. Это сохраняет
+последнее событие для восстановления. Восстановление запускается повтором клиента;
+фонового процесса восстановления нет. При внешней записи напрямую в NATS,
+удалении/пересоздании stream или ручном изменении таблиц может потребоваться
+сверка состояния оператором. Таблицу idempotency нельзя очищать без согласованной
+политики срока жизни ключей. Между JetStream и PostgreSQL нет общей транзакции:
+временно событие может быть видно в NATS/Redis до успешной записи `orders`.
 
 ---
 
@@ -207,7 +236,8 @@ order.status.order-100
 
 в stream остаётся только одно актуальное сообщение.
 
-При публикации используется `MsgId`, сформированный через SHA-256 от `order_id` и времени обновления.
+При публикации используется `MsgId` — SHA-256 от `Idempotency-Key`, а также
+`WithExpectLastSequencePerSubject` с ожидаемым sequence, сохранённым до публикации.
 
 ## Pull Consumer
 
@@ -221,7 +251,8 @@ MaxDeliver = 3
 FilterSubject = order.status.*
 ```
 
-Периодически consumer получает новые сообщения:
+Consumer сразу обрабатывает backlog через `FetchNoWait(100)` до пустого батча,
+затем проверяет новые сообщения каждую секунду:
 
 ```text
 JetStream
@@ -236,7 +267,9 @@ Redis SET
 Ack
 ```
 
-При ошибке записи в Redis выполняется повторная попытка через 10 секунд.
+При ошибке записи в Redis вызывается `NakWithDelay(10 * time.Second)`.
+Повтор доставляет JetStream; ручного retry-цикла нет. Невалидный JSON завершается
+через `Term()`. После третьей неудачной доставки сообщение также завершается.
 
 Максимальное количество попыток:
 
@@ -324,8 +357,8 @@ Redis      : 6379
 ## Запуск инфраструктуры
 
 ```bash
-cd docker-compose
-docker compose up -d
+cp .env.example .env # заполнить локальные значения
+docker compose --env-file .env -f docker-compose/docker-compose.yml up -d
 ```
 
 Проверить:
@@ -339,8 +372,10 @@ docker ps
 Из корня проекта:
 
 ```bash
-docker exec -i orders-postgres \
-  psql -U orders -d orders < migrations/001_init.sql
+docker compose --env-file .env -f docker-compose/docker-compose.yml exec -T postgres \
+  sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < migrations/created_orders_tables.sql
+docker compose --env-file .env -f docker-compose/docker-compose.yml exec -T postgres \
+  sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < migrations/idempotency_keys.sql
 ```
 
 ## Запуск приложения
@@ -348,8 +383,16 @@ docker exec -i orders-postgres \
 Из корня проекта:
 
 ```bash
+set -a
+source .env
+set +a
 go run ./cmd/api
 ```
+
+`.env` не загружается приложением автоматически и исключён из Git.
+При обновлении старой схемы миграция сохраняет завершённые ключи, но остановится,
+если есть старые `completed=false` записи без сохранённого намерения. Их нужно
+сначала сверить с JetStream; повторять такие операции вслепую небезопасно.
 
 Пример успешного запуска:
 
@@ -428,7 +471,8 @@ practiceNATSJetstream/
 │   ├── repository/
 │   └── worker/
 ├── migrations/
-│   └── 001_init.sql
+│   ├── created_orders_tables.sql
+│   └── idempotency_keys.sql
 ├── docker-compose/
 │   ├── docker-compose.yml
 │   └── nats.conf
@@ -439,3 +483,18 @@ practiceNATSJetstream/
 ├── go.mod
 └── go.sum
 ```
+
+## Интеграционные тесты
+
+Unit-тесты запускаются через `go test ./...`. Для PostgreSQL-тестов задать
+`TEST_POSTGRES_URL`: каждый тест создаёт отдельную схему и удаляет только её.
+Для NATS-тестов задать `TEST_NATS_URL`, указывающий на отдельный тестовый сервер
+с JetStream (тесты создают/настраивают `ORDERS`).
+
+```bash
+TEST_POSTGRES_URL="$POSTGRES_URL" TEST_NATS_URL="nats://127.0.0.1:14222" go test -race ./...
+```
+
+Проверяются атомарный claim, одинаковые/конфликтующие/параллельные запросы,
+отказ подготовки, ошибка и неопределённый результат publish, сбои SQL после
+публикации, откат order UPSERT при сбое завершения, CAS, NATS Drain и retry worker.

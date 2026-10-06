@@ -2,22 +2,23 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"practiceNATSJetstream/config"
 	_ "practiceNATSJetstream/docs"
 
 	"practiceNATSJetstream/internal/cache"
+	"practiceNATSJetstream/internal/database"
 	"practiceNATSJetstream/internal/handler"
 	natsclient "practiceNATSJetstream/internal/nats"
 	"practiceNATSJetstream/internal/repository"
 	"practiceNATSJetstream/internal/worker"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	httpSwagger "github.com/swaggo/http-swagger/v2"
 )
 
@@ -27,14 +28,14 @@ import (
 // @host localhost:8080
 // @BasePath /
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if err := run(); err != nil {
-		log.Fatal(err)
+		slog.Error("application stopped with error", "error", err)
+		os.Exit(1)
 	}
 }
 
 func run() error {
-	// Главный context приложения.
-	// Отменится при Ctrl+C или SIGTERM.
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -42,10 +43,15 @@ func run() error {
 	)
 	defer stop()
 
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
 	// PostgreSQL
-	db, err := pgxpool.New(
+	db, err := database.New(
 		ctx,
-		"postgres://orders:orders@localhost:5436/orders?sslmode=disable",
+		cfg.PostgresURL,
 	)
 	if err != nil {
 		return err
@@ -56,35 +62,44 @@ func run() error {
 		return err
 	}
 
-	log.Println("PostgreSQL connected")
+	slog.Info("PostgreSQL connected")
 
 	// NATS JetStream
-	natsClient, err := natsclient.New(ctx)
+	natsClient, err := natsclient.New(
+		ctx,
+		cfg.NATSURL,
+	)
 	if err != nil {
 		return err
 	}
 
 	defer func() {
 		if err := natsClient.Close(); err != nil {
-			log.Printf("NATS shutdown error: %v", err)
+			slog.Error(
+				"NATS shutdown error",
+				"error", err,
+			)
 		}
 	}()
 
-	log.Println("NATS JetStream connected")
+	slog.Info("NATS JetStream connected")
 
 	// Redis
-	redisClient, err := cache.NewRedisClient(ctx)
+	redisClient, err := cache.NewRedisClient(
+		ctx,
+		cfg.RedisAddr,
+	)
 	if err != nil {
 		return err
 	}
 	defer redisClient.Close()
 
-	log.Println("Redis connected")
+	slog.Info("Redis connected")
 
+	// Worker
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	defer cancelWorker()
 
-	// Pull Consumer
 	orderConsumer, err := worker.NewOrderConsumer(
 		ctx,
 		natsClient,
@@ -94,15 +109,12 @@ func run() error {
 		return err
 	}
 
-	log.Println("JetStream consumer created")
+	slog.Info("JetStream consumer created")
 
-	// Канал, через который узнаем,
-	// что consumer полностью завершился.
 	workerDone := make(chan struct{})
 
 	go func() {
 		defer close(workerDone)
-
 		orderConsumer.Run(workerCtx)
 	}()
 
@@ -131,25 +143,32 @@ func run() error {
 		"POST /api/admin/sync-cache",
 		handler.SyncCache(orderConsumer),
 	)
+
 	mux.Handle(
 		"/swagger/",
 		httpSwagger.WrapHandler,
 	)
+
 	// HTTP Server
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":" + cfg.HTTPPort,
 		Handler: mux,
 	}
 
 	serverErr := make(chan error, 1)
+
 	go func() {
-		log.Println("server started on :8080")
+		slog.Info(
+			"HTTP server started",
+			"addr", server.Addr,
+		)
 
 		serverErr <- server.ListenAndServe()
 	}()
 
-	// Ждём Ctrl+C / SIGTERM
+	// Ждём Ctrl+C / SIGTERM или ошибку HTTP-сервера.
 	var serveErr error
+
 	select {
 	case <-ctx.Done():
 	case err := <-serverErr:
@@ -157,9 +176,10 @@ func run() error {
 			serveErr = err
 		}
 	}
+
 	stop()
 
-	log.Println("shutting down...")
+	slog.Info("shutting down")
 
 	// Даём HTTP-запросам до 5 секунд на завершение.
 	shutdownCtx, cancel := context.WithTimeout(
@@ -169,21 +189,25 @@ func run() error {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP shutdown error: %v", err)
+		slog.Error(
+			"HTTP shutdown error",
+			"error", err,
+		)
+
 		if err := server.Close(); err != nil {
-			log.Printf("HTTP close error: %v", err)
+			slog.Error(
+				"HTTP close error",
+				"error", err,
+			)
 		}
 	}
 
-	// Останавливаем consumer до закрытия используемых им подключений.
+	// Сначала останавливаем consumer.
 	cancelWorker()
 	<-workerDone
-	log.Println("consumer stopped")
 
-	if err := natsClient.Close(); err != nil {
-		log.Printf("NATS shutdown error: %v", err)
-	}
+	slog.Info("consumer stopped")
+	slog.Info("server stopped")
 
-	log.Println("server stopped")
 	return serveErr
 }

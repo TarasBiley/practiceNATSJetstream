@@ -1,13 +1,17 @@
 package nats
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"errors"
+	"log/slog"
 	"time"
 
 	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
+
+var ErrPublishConflict = errors.New("order changed while publishing")
 
 type Client struct {
 	Conn   *natsgo.Conn
@@ -16,12 +20,21 @@ type Client struct {
 	closed <-chan struct{}
 }
 
-func New(ctx context.Context) (*Client, error) {
+func New(
+	ctx context.Context,
+	natsURL string,
+) (*Client, error) {
+
 	closed := make(chan struct{})
-	nc, err := natsgo.Connect("nats://localhost:4222",
+
+	nc, err := natsgo.Connect(
+		natsURL,
 		natsgo.DrainTimeout(5*time.Second),
-		natsgo.ClosedHandler(func(*natsgo.Conn) { close(closed) }),
+		natsgo.ClosedHandler(func(*natsgo.Conn) {
+			close(closed)
+		}),
 	)
+
 	if err != nil {
 		return nil, err
 	}
@@ -67,29 +80,41 @@ func (c *Client) Close() error {
 		return c.Conn.LastError()
 	case <-timer.C:
 		c.Conn.Close()
-		return fmt.Errorf("NATS drain timeout")
+		slog.Error("NATS drain timeout")
+
+		return errors.New("NATS drain timeout")
 	}
 }
 
+// PublishOrderStatus uses the durable expected sequence from the idempotency
+// record. Never refresh it after an ambiguous timeout: that could create a second
+// event once the JetStream deduplication window expires.
 func (c *Client) PublishOrderStatus(
-	ctx context.Context,
-	orderID string,
-	data []byte,
-	msgID string,
+	ctx context.Context, orderID string, data []byte, msgID string, expectedSeq uint64,
 ) (*jetstream.PubAck, error) {
-
 	subject := "order.status." + orderID
-
-	ack, err := c.JS.Publish(
-		ctx,
-		subject,
-		data,
-		jetstream.WithMsgID(msgID),
-	)
-	if err != nil {
+	lastMsg, err := c.Stream.GetLastMsgForSubject(ctx, subject)
+	if err != nil && !errors.Is(err, jetstream.ErrMsgNotFound) {
 		return nil, err
 	}
-
+	if err == nil && lastMsg.Header.Get(jetstream.MsgIDHeader) == msgID {
+		if !bytes.Equal(lastMsg.Data, data) {
+			return nil, ErrPublishConflict
+		}
+		return &jetstream.PubAck{Stream: "ORDERS", Sequence: lastMsg.Sequence, Duplicate: true}, nil
+	}
+	ack, err := c.JS.Publish(ctx, subject, data,
+		jetstream.WithMsgID(msgID),
+		jetstream.WithExpectLastSequencePerSubject(expectedSeq),
+	)
+	if err != nil {
+		var apiErr *jetstream.APIError
+		if errors.As(err, &apiErr) && (apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence ||
+			apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequenceConstant) {
+			return nil, ErrPublishConflict
+		}
+		return nil, err
+	}
 	return ack, nil
 }
 
@@ -99,11 +124,11 @@ func (c *Client) PrintStreamInfo(ctx context.Context) error {
 		return err
 	}
 
-	fmt.Printf(
-		"stream=%s messages=%d subjects=%d\n",
-		info.Config.Name,
-		info.State.Msgs,
-		info.State.NumSubjects,
+	slog.Info(
+		"NATS stream info",
+		"stream", info.Config.Name,
+		"messages", info.State.Msgs,
+		"subjects", info.State.NumSubjects,
 	)
 
 	return nil

@@ -11,9 +11,13 @@ type RedisClient struct {
 	Client *redis.Client
 }
 
-func NewRedisClient(ctx context.Context) (*RedisClient, error) {
+func NewRedisClient(
+	ctx context.Context,
+	addr string,
+) (*RedisClient, error) {
+
 	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: addr,
 	})
 
 	if err := client.Ping(ctx).Err(); err != nil {

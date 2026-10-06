@@ -3,7 +3,8 @@ package worker
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"errors"
+	"log/slog"
 	"practiceNATSJetstream/internal/cache"
 	"practiceNATSJetstream/internal/model"
 	natsclient "practiceNATSJetstream/internal/nats"
@@ -12,10 +13,21 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+const maxDeliveries = 3
+const retryDelay = 10 * time.Second
+
+type orderCache interface {
+	SetOrderStatus(context.Context, string, []byte) error
+}
+
+type batchConsumer interface {
+	FetchNoWait(int) (jetstream.MessageBatch, error)
+}
+
 type OrderConsumer struct {
 	natsClient  *natsclient.Client
-	redisClient *cache.RedisClient
-	consumer    jetstream.Consumer
+	redisClient orderCache
+	consumer    batchConsumer
 }
 
 func NewOrderConsumer(
@@ -31,7 +43,7 @@ func NewOrderConsumer(
 			Durable:       "ORDERS_CACHE",
 			AckPolicy:     jetstream.AckExplicitPolicy,
 			FilterSubject: "order.status.*",
-			MaxDeliver:    3,
+			MaxDeliver:    maxDeliveries,
 		},
 	)
 	if err != nil {
@@ -49,61 +61,82 @@ func (w *OrderConsumer) ProcessOnce(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	batch, err := w.consumer.Fetch(
-		100,
-		jetstream.FetchMaxWait(2*time.Second),
-	)
-	if err != nil {
-		return err
-	}
 
-	for msg := range batch.Messages() {
-		if ctx.Err() != nil {
-			continue // Оставляем сообщение без ACK для повторной доставки.
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		batch, err := w.consumer.FetchNoWait(100)
+		if err != nil {
+			return err
 		}
 
-		metadata, err := msg.Metadata()
-		if err == nil {
-			log.Printf(
-				"stream=%s subject=%s seq=%d delivery=%d",
-				metadata.Stream,
-				msg.Subject(),
-				metadata.Sequence.Stream,
-				metadata.NumDelivered,
+		n := 0
+
+		messages := batch.Messages()
+	batchLoop:
+		for {
+			var msg jetstream.Msg
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case next, ok := <-messages:
+				if !ok {
+					break batchLoop
+				}
+				msg = next
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			n++
+
+			metadata, err := msg.Metadata()
+			if err == nil {
+				slog.Info(
+					"JetStream message received",
+					"stream", metadata.Stream,
+					"subject", msg.Subject(),
+					"seq", metadata.Sequence.Stream,
+					"delivery", metadata.NumDelivered,
+				)
+			}
+
+			processCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				25*time.Second,
 			)
+
+			w.processMessage(processCtx, msg)
+			cancel()
 		}
 
-		// Завершаем текущее сообщение даже после сигнала остановки.
-		// Ограничиваем обработку, чтобы shutdown не завис на Redis/retry.
-		processCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 25*time.Second)
-		w.processMessage(processCtx, msg)
-		cancel()
-	}
+		if err := batch.Error(); err != nil {
+			return err
+		}
 
-	if err := batch.Error(); err != nil {
-		return err
+		if n == 0 {
+			break
+		}
 	}
 
 	return nil
 }
 
 func (w *OrderConsumer) Run(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-
-	log.Println("order consumer started")
-
+	slog.Info("order consumer started")
+	defer slog.Info("order consumer stopped")
 	for {
+		// Drain the entire available backlog immediately, then poll for new/redelivered messages.
+		if err := w.ProcessOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("consumer processing error", "error", err)
+		}
 		select {
-		case <-ticker.C:
-			err := w.ProcessOnce(ctx)
-			if err != nil {
-				log.Printf("consumer processing error: %v", err)
-			}
-
 		case <-ctx.Done():
-			log.Println("order consumer stopped")
 			return
+		case <-ticker.C:
 		}
 	}
 }
@@ -140,10 +173,11 @@ func (w *OrderConsumer) SyncCache(ctx context.Context) (int, error) {
 			return synced, err
 		}
 
-		log.Printf(
-			"sync-cache stream=ORDERS subject=%s seq=%d",
-			msg.Subject,
-			msg.Sequence,
+		slog.Info(
+			"cache synchronized",
+			"stream", "ORDERS",
+			"subject", msg.Subject,
+			"seq", msg.Sequence,
 		)
 
 		synced++
@@ -159,78 +193,98 @@ func (w *OrderConsumer) processMessage(
 	if ctx.Err() != nil {
 		return
 	}
+
 	var order model.Order
 
 	if err := json.Unmarshal(msg.Data(), &order); err != nil {
-		log.Printf("failed to decode message: %v", err)
+		slog.Error(
+			"failed to decode message",
+			"error", err,
+		)
 
 		if err := msg.Term(); err != nil {
-			log.Printf("failed to terminate message: %v", err)
+			slog.Error(
+				"failed to terminate message",
+				"error", err,
+			)
 		}
 
 		return
 	}
 
-	const maxAttempts = 3
+	metadata, metadataErr := msg.Metadata()
+	var delivery uint64
+	if metadataErr == nil {
+		delivery = metadata.NumDelivered
+	}
+	err := w.redisClient.SetOrderStatus(
+		ctx,
+		order.OrderID,
+		msg.Data(),
+	)
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	if err == nil {
+		if err := msg.Ack(); err != nil {
+			slog.Error(
+				"failed to ack message",
+				"order_id", order.OrderID,
+				"error", err,
+			)
+			return
+		}
 
-		err := w.redisClient.SetOrderStatus(
-			ctx,
-			order.OrderID,
-			msg.Data(),
+		slog.Info(
+			"order cached and acked",
+			"order_id", order.OrderID,
+			"attempt", delivery,
 		)
 
-		if err == nil {
-			if err := msg.Ack(); err != nil {
-				log.Printf("failed to ack message: %v", err)
-				return
-			}
+		return
+	}
 
-			log.Printf(
-				"order=%s cached and acked attempt=%d",
-				order.OrderID,
-				attempt,
-			)
+	if ctx.Err() != nil {
+		return
+	}
+	if metadataErr != nil {
+		slog.Error(
+			"failed to get message metadata",
+			"order_id", order.OrderID,
+			"error", metadataErr,
+		)
+	}
 
-			return
-		}
-
-		if ctx.Err() != nil {
-			return
-		}
-
-		log.Printf(
-			"failed to save order=%s to Redis attempt=%d/%d: %v",
-			order.OrderID,
-			attempt,
-			maxAttempts,
-			err,
+	if metadataErr == nil && metadata.NumDelivered >= maxDeliveries {
+		slog.Error(
+			"order cache retries exhausted",
+			"order_id", order.OrderID,
+			"delivery", metadata.NumDelivered,
+			"error", err,
 		)
 
-		if attempt == maxAttempts {
-			if err := msg.Term(); err != nil {
-				log.Printf("failed to terminate message: %v", err)
-			}
-
-			log.Printf(
-				"order=%s stopped after %d attempts",
-				order.OrderID,
-				maxAttempts,
+		if err := msg.Term(); err != nil {
+			slog.Error(
+				"failed to terminate message",
+				"order_id", order.OrderID,
+				"error", err,
 			)
-
-			return
 		}
 
-		timer := time.NewTimer(10 * time.Second)
+		return
+	}
 
-		select {
-		case <-timer.C:
-			// через 10 секунд следующая попытка
+	slog.Warn(
+		"failed to cache order, scheduling retry",
+		"order_id", order.OrderID,
+		"attempt", delivery,
+		"delay", retryDelay,
+		"error", err,
+	)
 
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		}
+	if err := msg.NakWithDelay(retryDelay); err != nil {
+		slog.Error(
+			"failed to NAK message",
+			"order_id", order.OrderID,
+			"error", err,
+		)
 	}
 }

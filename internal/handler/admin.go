@@ -2,7 +2,7 @@ package handler
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"practiceNATSJetstream/internal/worker"
@@ -24,7 +24,11 @@ func SyncCache(orderConsumer *worker.OrderConsumer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		synced, err := orderConsumer.SyncCache(r.Context())
 		if err != nil {
-			log.Printf("failed to sync cache synced=%d: %v", synced, err)
+			slog.Error(
+				"failed to sync cache",
+				"synced", synced,
+				"error", err,
+			)
 			http.Error(
 				w,
 				"failed to sync cache",

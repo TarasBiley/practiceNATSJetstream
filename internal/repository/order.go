@@ -6,6 +6,7 @@ import (
 
 	"practiceNATSJetstream/internal/model"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,26 +20,38 @@ func NewOrderRepository(db *pgxpool.Pool) *OrderRepository {
 	}
 }
 
-func (r *OrderRepository) Save(ctx context.Context, order model.Order) (time.Time, error) {
+func (r *OrderRepository) Save(
+	ctx context.Context,
+	order model.Order,
+) (time.Time, error) {
+	return saveOrder(ctx, r.db, order)
+}
+
+type orderQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func saveOrder(ctx context.Context, db orderQuerier, order model.Order) (time.Time, error) {
 	query := `
 		INSERT INTO orders (order_id, status, comment, updated_at)
-		VALUES ($1, $2, $3, NOW())
+		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (order_id)
 		DO UPDATE SET
 			status = EXCLUDED.status,
 			comment = EXCLUDED.comment,
-			updated_at = NOW()
+			updated_at = EXCLUDED.updated_at
 		RETURNING updated_at
 	`
 
 	var updatedAt time.Time
 
-	err := r.db.QueryRow(
+	err := db.QueryRow(
 		ctx,
 		query,
 		order.OrderID,
 		order.Status,
 		order.Comment,
+		order.UpdatedAt,
 	).Scan(&updatedAt)
 
 	return updatedAt, err

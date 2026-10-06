@@ -43,7 +43,7 @@ const docTemplate = `{
         },
         "/api/orders": {
             "post": {
-                "description": "Save current order status to PostgreSQL and publish event to NATS JetStream",
+                "description": "Publish the order status to JetStream, then save it to PostgreSQL. Retrying the same key and body resumes an unfinished request or returns its original result.",
                 "consumes": [
                     "application/json"
                 ],
@@ -55,6 +55,13 @@ const docTemplate = `{
                 ],
                 "summary": "Update order status",
                 "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unique request key; reuse only with the same body",
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": true
+                    },
                     {
                         "description": "Order status",
                         "name": "request",
@@ -78,8 +85,14 @@ const docTemplate = `{
                             "type": "string"
                         }
                     },
+                    "409": {
+                        "description": "Key reused with a different body, request in progress, or concurrent order update",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
                     "500": {
-                        "description": "Internal server error",
+                        "description": "Internal server error; retry with the same key and body",
                         "schema": {
                             "type": "string"
                         }
@@ -111,6 +124,12 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/model.Order"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid order_id",
+                        "schema": {
+                            "type": "string"
                         }
                     },
                     "404": {
@@ -152,6 +171,12 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/model.StreamOrderResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid order_id",
+                        "schema": {
+                            "type": "string"
                         }
                     },
                     "404": {
